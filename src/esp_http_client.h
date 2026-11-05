@@ -1,8 +1,11 @@
 #pragma once
 
+#include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <map>
 #include <string>
+#include <utility>
 
 #include "SimHttpFetch.h"
 #include "esp_err.h"
@@ -13,6 +16,9 @@ enum esp_http_client_method_t {
   HTTP_METHOD_GET,
   HTTP_METHOD_POST,
   HTTP_METHOD_PUT,
+  HTTP_METHOD_PATCH,
+  HTTP_METHOD_DELETE,
+  HTTP_METHOD_HEAD,
 };
 
 enum esp_http_client_auth_type_t {
@@ -63,6 +69,10 @@ struct SimEspHttpClient {
   std::string responseBody;
   size_t bodyOffset = 0;
   bool opened = false;
+  // esp_http_client_open(handle, len > 0): the body arrives through
+  // esp_http_client_write() and the request goes out at fetch_headers.
+  int pendingWriteLength = 0;
+  bool transferComplete = false;
 };
 
 namespace sim_http_client_detail {
@@ -72,10 +82,73 @@ inline const char *methodName(esp_http_client_method_t method) {
     return "POST";
   case HTTP_METHOD_PUT:
     return "PUT";
+  case HTTP_METHOD_PATCH:
+    return "PATCH";
+  case HTTP_METHOD_DELETE:
+    return "DELETE";
+  case HTTP_METHOD_HEAD:
+    return "HEAD";
   case HTTP_METHOD_GET:
   default:
     return "GET";
   }
+}
+
+inline void emitHeaderEvents(esp_http_client_handle_t handle,
+                             const sim_http_fetch::Response &response) {
+  if (!handle->config.event_handler)
+    return;
+  for (const auto &header : response.headers) {
+    esp_http_client_event_t event{};
+    event.event_id = HTTP_EVENT_ON_HEADER;
+    event.client = handle;
+    event.user_data = handle->config.user_data;
+    event.header_key = header.first.c_str();
+    event.header_value = header.second.c_str();
+    handle->config.event_handler(&event);
+  }
+}
+
+inline std::string basicAuthOf(esp_http_client_handle_t handle) {
+  std::string basicAuth;
+  if (handle->config.username &&
+      handle->config.auth_type != HTTP_AUTH_TYPE_NONE) {
+    basicAuth = handle->config.username;
+    basicAuth += ':';
+    if (handle->config.password)
+      basicAuth += handle->config.password;
+  }
+  return basicAuth;
+}
+
+inline sim_http_fetch::Request requestOf(esp_http_client_handle_t handle) {
+  sim_http_fetch::Request request;
+  request.url = handle->config.url;
+  request.method = methodName(handle->config.method);
+  request.headers = handle->headers;
+  request.basicAuth = basicAuthOf(handle);
+  if (!handle->postField.empty()) {
+    request.body = handle->postField.data();
+    request.bodyLength = handle->postField.size();
+  }
+  request.timeoutMs = handle->config.timeout_ms > 0
+                          ? static_cast<uint32_t>(handle->config.timeout_ms)
+                          : 0;
+  return request;
+}
+
+inline esp_err_t sendBuffered(esp_http_client_handle_t handle) {
+  sim_http_fetch::Response response;
+  if (!sim_http_fetch::fetch(requestOf(handle), response))
+    return ESP_FAIL;
+  handle->statusCode = response.statusCode;
+  handle->transferComplete = response.curlExitCode == 0;
+  emitHeaderEvents(handle, response);
+  handle->responseBody = std::move(response.body);
+  handle->contentLength = static_cast<int>(handle->responseBody.size());
+  handle->bodyOffset = 0;
+  handle->opened = true;
+  return ESP_OK;
 }
 } // namespace sim_http_client_detail
 
@@ -131,16 +204,14 @@ inline esp_err_t esp_http_client_perform(esp_http_client_handle_t handle) {
 
   using namespace sim_http_client_detail;
 
-  const char *method = methodName(handle->config.method);
   sim_http_fetch::Response response;
-  if (!sim_http_fetch::fetch(
-          handle->config.url, method, handle->headers, "",
-          handle->postField.empty() ? nullptr : handle->postField.c_str(),
-          response))
+  if (!sim_http_fetch::fetch(requestOf(handle), response))
     return ESP_FAIL;
 
   handle->statusCode = response.statusCode;
   handle->contentLength = static_cast<int>(response.body.size());
+  handle->transferComplete = response.curlExitCode == 0;
+  emitHeaderEvents(handle, response);
 
   if (handle->config.event_handler && !response.body.empty()) {
     esp_http_client_event_t event{};
@@ -156,34 +227,40 @@ inline esp_err_t esp_http_client_perform(esp_http_client_handle_t handle) {
 }
 
 inline esp_err_t esp_http_client_open(esp_http_client_handle_t handle,
-                                      int /*write_len*/) {
+                                      int write_len) {
   if (!handle || !handle->config.url)
     return ESP_FAIL;
-  using namespace sim_http_client_detail;
-  sim_http_fetch::Response response;
-  std::string basicAuth;
-  if (handle->config.username &&
-      handle->config.auth_type != HTTP_AUTH_TYPE_NONE) {
-    basicAuth = handle->config.username;
-    basicAuth += ':';
-    if (handle->config.password)
-      basicAuth += handle->config.password;
+  if (write_len > 0) {
+    handle->pendingWriteLength = write_len;
+    handle->postField.clear();
+    handle->postField.reserve(static_cast<size_t>(write_len));
+    return ESP_OK;
   }
-  if (!sim_http_fetch::fetch(
-          handle->config.url, methodName(handle->config.method),
-          handle->headers, basicAuth,
-          handle->postField.empty() ? nullptr : handle->postField.c_str(),
-          response))
+  return sim_http_client_detail::sendBuffered(handle);
+}
+
+inline int esp_http_client_write(esp_http_client_handle_t handle,
+                                 const char *buffer, int len) {
+  if (!handle || !buffer || len < 0 || handle->pendingWriteLength <= 0)
+    return -1;
+  handle->postField.append(buffer, static_cast<size_t>(len));
+  return len;
+}
+
+inline esp_err_t esp_http_client_set_method(esp_http_client_handle_t handle,
+                                            esp_http_client_method_t method) {
+  if (!handle)
     return ESP_FAIL;
-  handle->statusCode = response.statusCode;
-  handle->responseBody = std::move(response.body);
-  handle->contentLength = static_cast<int>(handle->responseBody.size());
-  handle->bodyOffset = 0;
-  handle->opened = true;
+  handle->config.method = method;
   return ESP_OK;
 }
 
 inline int64_t esp_http_client_fetch_headers(esp_http_client_handle_t handle) {
+  if (handle && handle->pendingWriteLength > 0) {
+    handle->pendingWriteLength = 0;
+    if (sim_http_client_detail::sendBuffered(handle) != ESP_OK)
+      return -1;
+  }
   if (!handle || !handle->opened)
     return -1;
   return static_cast<int64_t>(handle->responseBody.size());
@@ -221,7 +298,8 @@ inline bool
 esp_http_client_is_complete_data_received(esp_http_client_handle_t handle) {
   if (!handle || !handle->opened)
     return false;
-  return handle->bodyOffset >= handle->responseBody.size();
+  return handle->transferComplete &&
+         handle->bodyOffset >= handle->responseBody.size();
 }
 
 inline esp_err_t esp_http_client_get_and_clear_last_tls_error(

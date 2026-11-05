@@ -1,16 +1,26 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
+#include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <string>
+#include <utility>
+#include <vector>
 
+#include "SimFs.h"
+
+#ifndef _WIN32
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 namespace sim_http_fetch {
 
@@ -18,6 +28,41 @@ struct Response {
   int statusCode = 0;
   int curlExitCode = 0;
   std::string body;
+  // Lowercased names, in receive order. With redirects followed, these are the
+  // final response's headers.
+  std::vector<std::pair<std::string, std::string>> headers;
+  // The consumer stopped the transfer (onData returned false or shouldAbort
+  // returned true).
+  bool stoppedByData = false;
+  bool stoppedByAbort = false;
+
+  const std::string *header(const std::string &lowerName) const {
+    for (const auto &entry : headers) {
+      if (entry.first == lowerName)
+        return &entry.second;
+    }
+    return nullptr;
+  }
+};
+
+struct Request {
+  std::string url;
+  std::string method = "GET";
+  std::map<std::string, std::string> headers;
+  std::string basicAuth;
+  // Not assumed to be a C string: a null `body` means "no body".
+  const char *body = nullptr;
+  size_t bodyLength = 0;
+  bool insecureTls = false;
+  // Negative follows redirects with curl's own limit.
+  int maxRedirects = -1;
+  // Transfer limit; 0 keeps the default of 60 seconds.
+  uint32_t timeoutMs = 0;
+  // When set, the body goes here rather than to Response::body, and the
+  // response status and headers are already in Response when it is called.
+  std::function<bool(const char *data, size_t length, const Response &partial)>
+      onData;
+  std::function<bool()> shouldAbort;
 };
 
 inline bool startsWith(const std::string &value, const char *prefix) {
@@ -72,7 +117,7 @@ inline std::string basenameFromUrl(const std::string &url) {
 }
 
 inline bool readFile(const std::string &path, std::string &out) {
-  FILE *file = std::fopen(path.c_str(), "rb");
+  FILE *file = sim_fs::fopen(path.c_str(), "rb");
   if (!file)
     return false;
 
@@ -96,8 +141,8 @@ inline bool readFile(const std::string &path, std::string &out) {
 }
 
 inline bool isDirectory(const std::string &path) {
-  struct stat st{};
-  return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+  sim_fs::Stat st{};
+  return sim_fs::stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
 }
 
 inline bool findFileByBasename(const std::string &dir, const std::string &name,
@@ -105,11 +150,11 @@ inline bool findFileByBasename(const std::string &dir, const std::string &name,
   if (depth > 5)
     return false;
 
-  DIR *handle = opendir(dir.c_str());
+  sim_fs::DIR *handle = sim_fs::opendir(dir.c_str());
   if (!handle)
     return false;
 
-  while (dirent *entry = readdir(handle)) {
+  while (sim_fs::dirent *entry = sim_fs::readdir(handle)) {
     std::string entryName = entry->d_name;
     if (entryName == "." || entryName == "..")
       continue;
@@ -121,18 +166,18 @@ inline bool findFileByBasename(const std::string &dir, const std::string &name,
 
     if (entryName == name) {
       outPath = path;
-      closedir(handle);
+      sim_fs::closedir(handle);
       return true;
     }
 
     if (isDirectory(path) &&
         findFileByBasename(path, name, outPath, depth + 1)) {
-      closedir(handle);
+      sim_fs::closedir(handle);
       return true;
     }
   }
 
-  closedir(handle);
+  sim_fs::closedir(handle);
   return false;
 }
 
@@ -143,6 +188,11 @@ inline bool fetchFromFileUrl(const std::string &url, Response &out) {
   std::string path = urlDecode(url.substr(strlen("file://")));
   if (startsWith(path, "localhost/"))
     path = path.substr(strlen("localhost"));
+#ifdef _WIN32
+  // file:///D:/books/a.epub decodes to /D:/books/a.epub.
+  if (path.size() > 2 && path[0] == '/' && path[2] == ':')
+    path.erase(0, 1);
+#endif
 
   if (readFile(path, out.body)) {
     out.statusCode = 200;
@@ -154,8 +204,8 @@ inline bool fetchFromFileUrl(const std::string &url, Response &out) {
 }
 
 inline bool fetchFromMockRoot(const std::string &url, Response &out) {
-  const char *root = std::getenv("CROSSINK_SIM_HTTP_MOCK_ROOT");
-  if (!root || root[0] == '\0')
+  const std::string root = sim_fs::getEnv("CROSSINK_SIM_HTTP_MOCK_ROOT");
+  if (root.empty())
     return false;
 
   std::string name = basenameFromUrl(url);
@@ -184,33 +234,95 @@ inline bool fetchFromMockRoot(const std::string &url, Response &out) {
   return false;
 }
 
-inline bool fetchWithCurl(const std::string &url, const char *method,
-                          const std::map<std::string, std::string> &headers,
-                          const std::string &basicAuth, const char *body,
-                          Response &out) {
-  char tmpTemplate[] = "/tmp/crosspoint-sim-http-XXXXXX";
-  int fd = mkstemp(tmpTemplate);
+// Parses curl's --dump-header output. It holds one block per hop when redirects
+// are followed, so only the last block describes the response we are returning.
+inline void parseDumpedHeaders(const std::string &text, Response &out) {
+  out.headers.clear();
+  size_t start = 0;
+  while (start < text.size()) {
+    size_t end = text.find('\n', start);
+    if (end == std::string::npos)
+      end = text.size();
+    std::string line = text.substr(start, end - start);
+    start = end + 1;
+    if (!line.empty() && line.back() == '\r')
+      line.pop_back();
+    if (line.rfind("HTTP/", 0) == 0) {
+      out.headers.clear();
+      const size_t space = line.find(' ');
+      if (space != std::string::npos)
+        out.statusCode = std::atoi(line.c_str() + space + 1);
+      continue;
+    }
+    const size_t colon = line.find(':');
+    if (colon == std::string::npos)
+      continue;
+    std::string name = line.substr(0, colon);
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+      return static_cast<char>(std::tolower(c));
+    });
+    size_t valueStart = colon + 1;
+    while (valueStart < line.size() &&
+           (line[valueStart] == ' ' || line[valueStart] == '\t'))
+      ++valueStart;
+    out.headers.emplace_back(std::move(name), line.substr(valueStart));
+  }
+}
+
+#ifdef _WIN32
+
+// SimHttpFetchWin.cpp: runs curl.exe directly, without a shell, keeping
+// <windows.h> out of this header. The body arrives incrementally on a pipe.
+bool fetchWithCurl(const Request &request, Response &out);
+
+#else
+
+inline bool fetchWithCurl(const Request &request, Response &out) {
+  char bodyPath[] = "/tmp/crosspoint-sim-http-XXXXXX";
+  int fd = mkstemp(bodyPath);
   if (fd < 0)
     return false;
   close(fd);
+  char headerPath[] = "/tmp/crosspoint-sim-http-XXXXXX";
+  fd = mkstemp(headerPath);
+  if (fd < 0) {
+    unlink(bodyPath);
+    return false;
+  }
+  close(fd);
 
-  std::string cmd = "curl -L -sS --connect-timeout 10 --max-time 60 -o ";
-  cmd += shellQuote(tmpTemplate);
+  std::string cmd = "curl";
+  if (request.maxRedirects != 0)
+    cmd += " -L";
+  if (request.maxRedirects > 0)
+    cmd += " --max-redirs " + std::to_string(request.maxRedirects);
+  if (request.insecureTls)
+    cmd += " -k";
+  cmd += " -sS --connect-timeout 10 --max-time ";
+  cmd += std::to_string(request.timeoutMs ? (request.timeoutMs + 999) / 1000
+                                          : 60);
+  cmd += " -o ";
+  cmd += shellQuote(bodyPath);
+  cmd += " -D ";
+  cmd += shellQuote(headerPath);
   cmd += " -w '%{http_code}'";
-  if (method && std::string(method) != "GET")
-    cmd += " -X " + shellQuote(method);
-  for (const auto &header : headers) {
+  if (request.method != "GET")
+    cmd += " -X " + shellQuote(request.method);
+  for (const auto &header : request.headers) {
     cmd += " -H " + shellQuote(header.first + ": " + header.second);
   }
-  if (!basicAuth.empty())
-    cmd += " -u " + shellQuote(basicAuth);
-  if (body)
-    cmd += " --data-binary " + shellQuote(body);
-  cmd += " " + shellQuote(url);
+  if (!request.basicAuth.empty())
+    cmd += " -u " + shellQuote(request.basicAuth);
+  // A body passed on the command line stops at its first NUL byte.
+  if (request.body)
+    cmd += " --data-binary " +
+           shellQuote(std::string(request.body, request.bodyLength));
+  cmd += " " + shellQuote(request.url);
 
   FILE *pipe = popen(cmd.c_str(), "r");
   if (!pipe) {
-    unlink(tmpTemplate);
+    unlink(bodyPath);
+    unlink(headerPath);
     return false;
   }
 
@@ -224,25 +336,70 @@ inline bool fetchWithCurl(const std::string &url, const char *method,
   if (rc >= 0 && WIFEXITED(rc))
     out.curlExitCode = WEXITSTATUS(rc);
 
-  bool readOk = readFile(tmpTemplate, out.body);
-  unlink(tmpTemplate);
+  bool readOk = readFile(bodyPath, out.body);
+  unlink(bodyPath);
   if (!readOk)
     out.body.clear();
 
+  std::string dumpedHeaders;
+  if (readFile(headerPath, dumpedHeaders))
+    parseDumpedHeaders(dumpedHeaders, out);
+  unlink(headerPath);
+
   out.statusCode = std::atoi(statusText.c_str());
   return rc == 0 || out.statusCode > 0 || !out.body.empty();
+}
+
+#endif
+
+// Hands an already complete body to a streaming consumer.
+inline void deliverBody(const Request &request, Response &out) {
+  if (!request.onData || out.body.empty())
+    return;
+  const std::string body = std::move(out.body);
+  out.body.clear();
+  constexpr size_t kChunk = 4096;
+  for (size_t offset = 0; offset < body.size(); offset += kChunk) {
+    if (request.shouldAbort && request.shouldAbort()) {
+      out.stoppedByAbort = true;
+      return;
+    }
+    const size_t length = std::min(kChunk, body.size() - offset);
+    if (!request.onData(body.data() + offset, length, out)) {
+      out.stoppedByData = true;
+      return;
+    }
+  }
+}
+
+inline bool fetch(const Request &request, Response &out) {
+  out = Response{};
+  if (fetchFromMockRoot(request.url, out) ||
+      fetchFromFileUrl(request.url, out)) {
+    deliverBody(request, out);
+    return true;
+  }
+  const bool ok = fetchWithCurl(request, out);
+#ifndef _WIN32
+  // The POSIX path buffers to a temp file first; Windows streams already.
+  deliverBody(request, out);
+#endif
+  return ok;
 }
 
 inline bool fetch(const std::string &url, const char *method,
                   const std::map<std::string, std::string> &headers,
                   const std::string &basicAuth, const char *body,
                   Response &out) {
-  out = Response{};
-  if (fetchFromMockRoot(url, out))
-    return true;
-  if (fetchFromFileUrl(url, out))
-    return true;
-  return fetchWithCurl(url, method, headers, basicAuth, body, out);
+  Request request;
+  request.url = url;
+  if (method)
+    request.method = method;
+  request.headers = headers;
+  request.basicAuth = basicAuth;
+  request.body = body;
+  request.bodyLength = body ? std::strlen(body) : 0;
+  return fetch(request, out);
 }
 
 } // namespace sim_http_fetch

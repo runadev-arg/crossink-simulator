@@ -22,7 +22,7 @@ def run_simulator(source, target, env):
     import os
     import subprocess
 
-    binary = env.subst("$BUILD_DIR/program")
+    binary = env.subst("$BUILD_DIR/program$PROGSUFFIX")
     runtime_env = os.environ.copy()
     configured_http_port = env.GetProjectOption(
         SIMULATOR_HTTP_PORT_OPTION, ""
@@ -36,7 +36,7 @@ def run_existing_simulator(source, target, env):
     import os
     import subprocess
 
-    binary = env.subst("$BUILD_DIR/program")
+    binary = env.subst("$BUILD_DIR/program$PROGSUFFIX")
     if not os.path.isfile(binary):
         print(f"Simulator binary not found: {binary}")
         print(f"Build it first with: pio run -e {env.subst('$PIOENV')}")

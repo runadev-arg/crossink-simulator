@@ -15,6 +15,10 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <malloc.h> // _aligned_malloc
+#endif
+
 constexpr uint32_t MALLOC_CAP_DEFAULT = 1;
 constexpr uint32_t MALLOC_CAP_INTERNAL = 2;
 constexpr uint32_t MALLOC_CAP_SPIRAM = 4;
@@ -29,6 +33,8 @@ struct Allocation {
   bool psram;
   size_t start;
   size_t size;
+  // Windows only: _aligned_malloc memory must not reach free().
+  bool hostAligned = false;
 };
 struct Pool {
   size_t total = 0;
@@ -193,10 +199,18 @@ inline void *allocateFromPool(Pool &pool, const bool poolIsPsram,
         bytes > it->size - (alignedStart - it->start))
       continue;
     void *pointer = nullptr;
+    bool hostAligned = false;
     if (alignment <= alignof(std::max_align_t))
       pointer = std::malloc(bytes);
+#ifdef _WIN32
+    else {
+      pointer = _aligned_malloc(bytes, alignment);
+      hostAligned = true;
+    }
+#else
     else if (posix_memalign(&pointer, alignment, bytes) != 0)
       pointer = nullptr;
+#endif
     if (!pointer)
       return nullptr;
     const Range original = *it;
@@ -214,7 +228,8 @@ inline void *allocateFromPool(Pool &pool, const bool poolIsPsram,
     pool.free -= bytes;
     pool.minimumFree = std::min(pool.minimumFree, pool.free);
     ++pool.allocatedBlocks;
-    live.emplace(pointer, Allocation{poolIsPsram, alignedStart, bytes});
+    live.emplace(pointer,
+                 Allocation{poolIsPsram, alignedStart, bytes, hostAligned});
     recomputeLargest(pool);
     return pointer;
   }
@@ -277,10 +292,19 @@ inline void release(void *pointer) {
   }
   Pool &pool = found->second.psram ? psram : internal;
   const size_t bytes = found->second.size;
+  const bool hostAligned = found->second.hostAligned;
   freeRange(pool, {found->second.start, bytes});
   pool.free += bytes;
   --pool.allocatedBlocks;
   live.erase(found);
+#ifdef _WIN32
+  if (hostAligned) {
+    _aligned_free(pointer);
+    return;
+  }
+#else
+  (void)hostAligned;
+#endif
   std::free(pointer);
 }
 } // namespace simulator_heap

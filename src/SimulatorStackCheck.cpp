@@ -3,8 +3,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifdef _WIN32
+#include <process.h> // _exit
+#else
 #include <dlfcn.h>
 #include <unistd.h>
+#endif
 
 #define NO_INSTRUMENT __attribute__((no_instrument_function))
 
@@ -143,6 +147,8 @@ extern "C" NO_INSTRUMENT void __cyg_profile_func_enter(void *function,
                "function=%p caller=%p (host estimate, not ESP32 measurement)\n",
                failOnOverflow ? "FAIL" : "WARNING", currentName,
                static_cast<size_t>(used), budget, function, caller);
+#ifndef _WIN32
+  // No dladdr on Windows: the report still has the raw addresses above.
   Dl_info location{};
   if (dladdr(function, &location) && location.dli_fbase) {
     const uintptr_t offset = reinterpret_cast<uintptr_t>(function) -
@@ -152,6 +158,7 @@ extern "C" NO_INSTRUMENT void __cyg_profile_func_enter(void *function,
                  static_cast<size_t>(offset),
                  location.dli_sname ? location.dli_sname : "?");
   }
+#endif
   std::fflush(stderr);
   if (failOnOverflow)
     _exit(86);

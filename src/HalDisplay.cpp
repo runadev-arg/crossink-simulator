@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "SimFs.h"
 #include "SimulatorInput.h"
 
 static SDL_Window *window = nullptr;
@@ -119,11 +120,11 @@ void initializeScreenshotEvents() {
     return;
   screenshotEventsInitialized = true;
 
-  const char *schedule = std::getenv("CROSSPOINT_SIM_SCREENSHOTS");
-  if (!schedule || schedule[0] == '\0')
+  // SDL_SaveBMP takes UTF-8 paths.
+  const std::string spec = sim_fs::getEnv("CROSSPOINT_SIM_SCREENSHOTS");
+  if (spec.empty())
     return;
 
-  const std::string spec(schedule);
   size_t start = 0;
   while (start < spec.size()) {
     const size_t end = spec.find(';', start);
@@ -345,6 +346,14 @@ void HalDisplay::begin() {
                             SDL_WINDOWPOS_UNDEFINED, winW, winH,
                             SDL_WINDOW_SHOWN | SDL_WINDOW_ALLOW_HIGHDPI);
   sdl_renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+  if (!sdl_renderer) {
+    // SDL_VIDEODRIVER=dummy (unattended runs) only has the software renderer.
+    sdl_renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+  }
+  if (!sdl_renderer) {
+    std::cerr << "SDL could not create a renderer: " << SDL_GetError()
+              << std::endl;
+  }
 
   // Keep all rendering logic in logical (winW×winH) coordinates; SDL maps to
   // drawable pixels.

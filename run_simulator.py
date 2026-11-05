@@ -39,7 +39,7 @@ SIMULATOR_HTTP_PORT_OPTION = "custom_simulator_http_port"
 def _run_simulator(source, target, env):
     import subprocess
 
-    binary = env.subst("$BUILD_DIR/program")
+    binary = env.subst("$BUILD_DIR/program$PROGSUFFIX")
     runtime_env = os.environ.copy()
     configured_http_port = env.GetProjectOption(
         SIMULATOR_HTTP_PORT_OPTION, ""

@@ -3,13 +3,7 @@
 #include <HalStorage.h>
 #include <Logging.h>
 #include <WiFi.h>
-#include <arpa/inet.h>
 #include <fcntl.h>
-#include <netinet/in.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -30,6 +24,8 @@
 #endif
 
 #include "network/CrossPointWebServer.h"
+
+#include "SimSocketPlatform.h"
 
 #ifndef CROSSPOINT_VERSION
 #ifdef CROSSINK_VERSION
@@ -193,7 +189,7 @@ std::string parentOf(const std::string &path) {
 bool sendAll(int client, const void *data, size_t len) {
   const auto *ptr = static_cast<const char *>(data);
   while (len > 0) {
-    const ssize_t written = send(client, ptr, len, 0);
+    const ssize_t written = sim_socket::send(client, ptr, len);
     if (written <= 0)
       return false;
     ptr += written;
@@ -269,7 +265,7 @@ bool parseRequest(int client, Request &req) {
   std::string raw;
   char buffer[8192];
   while (raw.find("\r\n\r\n") == std::string::npos) {
-    const ssize_t got = recv(client, buffer, sizeof(buffer), 0);
+    const ssize_t got = sim_socket::recv(client, buffer, sizeof(buffer));
     if (got <= 0)
       return false;
     raw.append(buffer, static_cast<size_t>(got));
@@ -318,8 +314,8 @@ bool parseRequest(int client, Request &req) {
     return false;
   while (req.body.size() < contentLength) {
     const ssize_t got =
-        recv(client, buffer,
-             std::min(sizeof(buffer), contentLength - req.body.size()), 0);
+        sim_socket::recv(client, buffer,
+                         std::min(sizeof(buffer), contentLength - req.body.size()));
     if (got <= 0)
       return false;
     req.body.append(buffer, static_cast<size_t>(got));
@@ -987,14 +983,13 @@ void acceptLoop(CrossPointWebServer *owner, NativeServerState *state) {
 
     sockaddr_in addr{};
     socklen_t len = sizeof(addr);
-    int client = accept(state->fd, reinterpret_cast<sockaddr *>(&addr), &len);
+    int client = static_cast<int>(
+        accept(state->fd, reinterpret_cast<sockaddr *>(&addr), &len));
     if (client < 0)
       continue;
-    timeval readTimeout{5, 0};
-    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &readTimeout,
-               sizeof(readTimeout));
+    sim_socket::setTimeoutSeconds(client, 5);
     handleClientRequest(owner, *state, client);
-    close(client);
+    sim_socket::close(client);
   }
 }
 } // namespace
@@ -1008,14 +1003,14 @@ void CrossPointWebServer::begin() {
     return;
 
   auto state = std::make_unique<NativeServerState>();
-  state->fd = socket(AF_INET, SOCK_STREAM, 0);
+  sim_socket::init();
+  state->fd = static_cast<int>(socket(AF_INET, SOCK_STREAM, 0));
   if (state->fd < 0) {
-    LOG_ERR("WEB", "[SIM] socket failed: %s", strerror(errno));
+    LOG_ERR("WEB", "[SIM] socket failed: %s", sim_socket::lastError().c_str());
     return;
   }
 
-  int yes = 1;
-  setsockopt(state->fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+  sim_socket::setListenerAddressOptions(state->fd);
 
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
@@ -1023,13 +1018,14 @@ void CrossPointWebServer::begin() {
   addr.sin_port = htons(port);
 
   if (bind(state->fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
-    LOG_ERR("WEB", "[SIM] bind 127.0.0.1:%d failed: %s", port, strerror(errno));
-    close(state->fd);
+    LOG_ERR("WEB", "[SIM] bind 127.0.0.1:%d failed: %s", port,
+            sim_socket::lastError().c_str());
+    sim_socket::close(state->fd);
     return;
   }
   if (listen(state->fd, 16) != 0) {
-    LOG_ERR("WEB", "[SIM] listen failed: %s", strerror(errno));
-    close(state->fd);
+    LOG_ERR("WEB", "[SIM] listen failed: %s", sim_socket::lastError().c_str());
+    sim_socket::close(state->fd);
     return;
   }
 
@@ -1060,8 +1056,8 @@ void CrossPointWebServer::stop() {
     return;
   state->active = false;
   if (state->fd >= 0) {
-    shutdown(state->fd, SHUT_RDWR);
-    close(state->fd);
+    sim_socket::shutdownBoth(state->fd);
+    sim_socket::close(state->fd);
     state->fd = -1;
   }
   if (state->worker.joinable())

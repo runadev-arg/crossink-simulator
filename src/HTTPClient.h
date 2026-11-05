@@ -1,9 +1,13 @@
 #pragma once
 
+#include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "SimHttpFetch.h"
 #include "Stream.h"
@@ -57,7 +61,7 @@ public:
   void setFollowRedirects(int mode) { (void)mode; }
   void setReuse(bool reuse) { (void)reuse; }
   void setConnectTimeout(int32_t timeout) { (void)timeout; }
-  void setTimeout(uint16_t timeout) { (void)timeout; }
+  void setTimeout(uint32_t timeout) { timeoutMs_ = timeout; }
   void addHeader(const char *name, const String &value) {
     if (name)
       headers_[name] = value.c_str();
@@ -74,10 +78,39 @@ public:
   int GET() { return perform("GET", nullptr); }
   int POST() { return perform("POST", ""); }
   int POST(const char *body) { return perform("POST", body ? body : ""); }
+  int POST(const String &body) {
+    return perform("POST", body.s.data(), body.s.size());
+  }
+  int POST(const uint8_t *body, size_t length) {
+    return perform("POST", reinterpret_cast<const char *>(body), length);
+  }
   int PUT(const char *body) { return perform("PUT", body ? body : ""); }
-  int PUT(const String &body) { return perform("PUT", body.c_str()); }
+  int PUT(const String &body) {
+    return perform("PUT", body.s.data(), body.s.size());
+  }
+  int PUT(const uint8_t *body, size_t length) {
+    return perform("PUT", reinterpret_cast<const char *>(body), length);
+  }
+  int sendRequest(const char *method, const uint8_t *body, size_t length) {
+    return perform(method, reinterpret_cast<const char *>(body), length);
+  }
+  int sendRequest(const char *method, const String &body) {
+    return perform(method, body.s.data(), body.s.size());
+  }
+  int sendRequest(const char *method) { return perform(method, nullptr); }
 
   String getString() { return responseBody_; }
+  // First response header with this name (case-insensitive), or empty.
+  String header(const char *name) const {
+    std::string lowered = name ? name : "";
+    for (char &c : lowered)
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    for (const auto &entry : responseHeaders_) {
+      if (entry.first == lowered)
+        return String(entry.second);
+    }
+    return String();
+  }
   int getSize() { return static_cast<int>(responseBody_.length()); }
   Stream *getStreamPtr() {
     if (!responseStream_)
@@ -99,7 +132,9 @@ public:
     url_.clear();
     headers_.clear();
     basicAuth_.clear();
+    timeoutMs_ = 0;
     responseBody_ = "";
+    responseHeaders_.clear();
     responseStream_.reset();
     statusCode_ = 0;
   }
@@ -166,16 +201,31 @@ private:
   std::string url_;
   std::map<std::string, std::string> headers_;
   std::string basicAuth_;
+  uint32_t timeoutMs_ = 0;
   String responseBody_;
+  std::vector<std::pair<std::string, std::string>> responseHeaders_;
   std::unique_ptr<ResponseBodyStream> responseStream_;
   int statusCode_ = 0;
 
   int perform(const char *method, const char *body) {
+    return perform(method, body, body ? std::strlen(body) : 0);
+  }
+
+  int perform(const char *method, const char *body, size_t bodyLength) {
     if (url_.empty())
       return 0;
 
+    sim_http_fetch::Request request;
+    request.url = url_;
+    request.method = method ? method : "GET";
+    request.headers = headers_;
+    request.basicAuth = basicAuth_;
+    request.body = body;
+    request.bodyLength = bodyLength;
+    request.timeoutMs = timeoutMs_;
+
     sim_http_fetch::Response response;
-    if (!sim_http_fetch::fetch(url_, method, headers_, basicAuth_, body, response)) {
+    if (!sim_http_fetch::fetch(request, response)) {
       responseBody_ = "";
       responseStream_.reset();
       statusCode_ = 0;
@@ -183,6 +233,7 @@ private:
     }
 
     responseBody_ = response.body;
+    responseHeaders_ = std::move(response.headers);
     responseStream_.reset();
     statusCode_ = response.statusCode;
     return statusCode_;

@@ -3,7 +3,7 @@
 A desktop simulator for [CrossInk](https://github.com/uxjulia/CrossInk). Compiles the firmware natively and renders the e-ink display in an SDL2 window. No device required.
 
 > [!NOTE]
-> **Platform support:** macOS and Linux/WSL use different native compiler and library flags. Start from `sample-platformio-macos.ini` on macOS, or `sample-platformio-linux-wsl.ini` on Linux/WSL. Native Windows is not supported; use WSL and follow the Linux instructions.
+> **Platform support:** macOS and Linux/WSL use different native compiler and library flags. Start from `sample-platformio-macos.ini` on macOS, or `sample-platformio-linux-wsl.ini` on Linux/WSL. For native Windows, see [Native Windows](#native-windows).
 
 > [!WARNING]
 > This has been tested on x86_64 macOS (Intel), ARM64 macOS (Apple Silicon,
@@ -135,6 +135,31 @@ pio run -e simulator -t run_simulator_no_build
 
 The project hook exposes this as **Run Simulator (No Build)** alongside the
 existing **Run Simulator** task in PlatformIO's Custom folder.
+
+## Native Windows
+
+Builds with [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) (clang, UCRT) and
+the SDL2 `x86_64-w64-mingw32` development package, without WSL. There is no
+`sdl2-config`, so the firmware environment passes explicit `-I`/`-L` flags, links
+through `libSDL2.dll.a` and keeps `SDL2.dll` next to `program.exe`. It must also
+force-include `src/SimWindowsPreinclude.h`, which holds the few libc functions the
+UCRT lacks. `curl.exe` must be on `PATH`; Windows 10 and later ship it.
+
+How it differs from the other hosts:
+
+- **Supervisor process.** Windows has no `exec()`, so the process you start runs
+  the simulator as a child and stays alive. A firmware reboot or sleep/wake ends
+  the child and starts a new one with the updated environment. The exit code you
+  see is the last child's. Killing the supervisor kills the child.
+- **Storage** goes through `SimFs`: UTF-8 paths on the wide Win32 API, binary files
+  only, `rename` replaces its target, and open files can be renamed and removed.
+- **Unattended runs:** `SDL_VIDEODRIVER=dummy` shows no window. The renderer falls
+  back to SDL's software renderer, and screenshots still work.
+- **Temp files** of HTTP requests go in `TMP`.
+- **Task-stack checks** report raw addresses only, without `dladdr`'s image offset.
+
+`tests/run_http_stack_check.py` checks the HTTP clients, MD5 and storage against a
+local server on any host with a C++ compiler.
 
 ## Controls
 

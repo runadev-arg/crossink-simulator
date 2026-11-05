@@ -2,12 +2,7 @@
 
 #include "SimulatorNetworkPorts.h"
 #include <Logging.h>
-#include <arpa/inet.h>
 #include <fcntl.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -20,6 +15,8 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#include "SimSocketPlatform.h"
 
 namespace {
 constexpr size_t MAX_BODY_SIZE = 256UL * 1024UL * 1024UL;
@@ -159,13 +156,8 @@ void parseArgs(const std::string &encoded,
 
 bool sendAll(int client, const void *data, size_t len) {
   const auto *ptr = static_cast<const char *>(data);
-#ifdef MSG_NOSIGNAL
-  constexpr int sendFlags = MSG_NOSIGNAL;
-#else
-  constexpr int sendFlags = 0;
-#endif
   while (len > 0) {
-    const ssize_t written = ::send(client, ptr, len, sendFlags);
+    const ssize_t written = sim_socket::send(client, ptr, len);
     if (written <= 0)
       return false;
     ptr += written;
@@ -185,16 +177,7 @@ void sendSimpleResponse(int client, int code, const char *message) {
   sendAll(client, out.str().data(), out.str().size());
 }
 
-void setSocketTimeouts(int client) {
-  timeval timeout{};
-  timeout.tv_sec = 5;
-  setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-  setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-#ifdef SO_NOSIGPIPE
-  int yes = 1;
-  setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
-#endif
-}
+void setSocketTimeouts(int client) { sim_socket::setTimeoutSeconds(client, 5); }
 
 struct MultipartPart {
   std::string name;
@@ -421,14 +404,15 @@ void WebServer::begin() {
   if (impl_->active)
     return;
 
-  impl_->fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  sim_socket::init();
+  impl_->fd = static_cast<int>(::socket(AF_INET, SOCK_STREAM, 0));
   if (impl_->fd < 0) {
-    LOG_ERR("WEB", "[SIM] WebServer socket failed: %s", strerror(errno));
+    LOG_ERR("WEB", "[SIM] WebServer socket failed: %s",
+            sim_socket::lastError().c_str());
     return;
   }
 
-  int yes = 1;
-  setsockopt(impl_->fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+  sim_socket::setListenerAddressOptions(impl_->fd);
 
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
@@ -437,14 +421,15 @@ void WebServer::begin() {
   if (::bind(impl_->fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) !=
       0) {
     LOG_ERR("WEB", "[SIM] WebServer bind 127.0.0.1:%d failed: %s", impl_->port,
-            strerror(errno));
-    ::close(impl_->fd);
+            sim_socket::lastError().c_str());
+    sim_socket::close(impl_->fd);
     impl_->fd = -1;
     return;
   }
   if (::listen(impl_->fd, 16) != 0) {
-    LOG_ERR("WEB", "[SIM] WebServer listen failed: %s", strerror(errno));
-    ::close(impl_->fd);
+    LOG_ERR("WEB", "[SIM] WebServer listen failed: %s",
+            sim_socket::lastError().c_str());
+    sim_socket::close(impl_->fd);
     impl_->fd = -1;
     return;
   }
@@ -452,10 +437,12 @@ void WebServer::begin() {
   impl_->active = true;
   impl_->worker = std::thread([this] {
     while (impl_->active) {
-      const int client = ::accept(impl_->fd, nullptr, nullptr);
+      const int client =
+          static_cast<int>(::accept(impl_->fd, nullptr, nullptr));
       if (client < 0) {
         if (impl_->active)
-          LOG_ERR("WEB", "[SIM] WebServer accept failed: %s", strerror(errno));
+          LOG_ERR("WEB", "[SIM] WebServer accept failed: %s",
+                  sim_socket::lastError().c_str());
         continue;
       }
       setSocketTimeouts(client);
@@ -463,7 +450,7 @@ void WebServer::begin() {
       std::string raw;
       char buffer[8192];
       while (raw.find("\r\n\r\n") == std::string::npos) {
-        const ssize_t got = ::recv(client, buffer, sizeof(buffer), 0);
+        const ssize_t got = sim_socket::recv(client, buffer, sizeof(buffer));
         if (got <= 0)
           break;
         raw.append(buffer, static_cast<size_t>(got));
@@ -473,7 +460,7 @@ void WebServer::begin() {
 
       const size_t headerEnd = raw.find("\r\n\r\n");
       if (headerEnd == std::string::npos) {
-        ::close(client);
+        sim_socket::close(client);
         continue;
       }
 
@@ -529,7 +516,7 @@ void WebServer::begin() {
           impl_->emitRawEvent(*this, rawHandlers, RAW_ABORTED, nullptr, 0);
         }
         sendSimpleResponse(client, 413, "Payload Too Large");
-        ::close(client);
+        sim_socket::close(client);
         continue;
       }
       if (body.size() > bodyLength)
@@ -546,7 +533,7 @@ void WebServer::begin() {
         }
       }
       while (body.size() < bodyLength) {
-        const ssize_t got = ::recv(client, buffer, sizeof(buffer), 0);
+        const ssize_t got = sim_socket::recv(client, buffer, sizeof(buffer));
         if (got <= 0)
           break;
         const size_t offset = body.size();
@@ -575,7 +562,7 @@ void WebServer::begin() {
         if (contentType.find("multipart/form-data") != std::string::npos)
           impl_->emitMultipartAbort();
         sendSimpleResponse(client, 400, "Incomplete request body");
-        ::close(client);
+        sim_socket::close(client);
         continue;
       }
       if (hasRawHandlers)
@@ -661,7 +648,7 @@ void WebServer::begin() {
         }
       }
 
-      ::close(client);
+      sim_socket::close(client);
       impl_->resetRequest();
     }
   });
@@ -697,8 +684,8 @@ void WebServer::collectHeaders(const char **headers, size_t count) {
 void WebServer::stop() {
   impl_->active = false;
   if (impl_->fd >= 0) {
-    ::shutdown(impl_->fd, SHUT_RDWR);
-    ::close(impl_->fd);
+    sim_socket::shutdownBoth(impl_->fd);
+    sim_socket::close(impl_->fd);
     impl_->fd = -1;
   }
   if (impl_->worker.joinable())
@@ -798,10 +785,10 @@ String WebServer::urlDecode(const String &str) {
 NetworkClient WebServer::client() {
   if (impl_->currentClient < 0)
     return NetworkClient(-1);
-  const int fd = ::dup(impl_->currentClient);
+  const int fd = sim_socket::dup(impl_->currentClient);
   if (fd < 0)
     LOG_ERR("WEB", "[SIM] Failed to duplicate client socket: %s",
-            strerror(errno));
+            sim_socket::lastError().c_str());
   return NetworkClient(fd);
 }
 long WebServer::clientContentLength() {

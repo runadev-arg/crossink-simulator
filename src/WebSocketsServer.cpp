@@ -2,11 +2,6 @@
 
 #include "SimulatorNetworkPorts.h"
 #include <Logging.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -20,6 +15,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include "SimSocketPlatform.h"
 
 namespace {
 constexpr size_t MAX_WS_PAYLOAD = 256UL * 1024UL * 1024UL;
@@ -48,7 +45,7 @@ std::string trim(std::string value) {
 bool recvAll(int fd, void *data, size_t len) {
   auto *ptr = static_cast<uint8_t *>(data);
   while (len > 0) {
-    const ssize_t got = ::recv(fd, ptr, len, 0);
+    const ssize_t got = sim_socket::recv(fd, ptr, len);
     if (got <= 0)
       return false;
     ptr += got;
@@ -59,13 +56,8 @@ bool recvAll(int fd, void *data, size_t len) {
 
 bool sendAll(int fd, const void *data, size_t len) {
   const auto *ptr = static_cast<const uint8_t *>(data);
-#ifdef MSG_NOSIGNAL
-  constexpr int sendFlags = MSG_NOSIGNAL;
-#else
-  constexpr int sendFlags = 0;
-#endif
   while (len > 0) {
-    const ssize_t sent = ::send(fd, ptr, len, sendFlags);
+    const ssize_t sent = sim_socket::send(fd, ptr, len);
     if (sent <= 0)
       return false;
     ptr += sent;
@@ -74,16 +66,7 @@ bool sendAll(int fd, const void *data, size_t len) {
   return true;
 }
 
-void setSocketTimeouts(int fd) {
-  timeval timeout{};
-  timeout.tv_sec = 5;
-  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-#ifdef SO_NOSIGPIPE
-  int yes = 1;
-  setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
-#endif
-}
+void setSocketTimeouts(int fd) { sim_socket::setTimeoutSeconds(fd, 5); }
 
 std::array<uint8_t, 20> sha1Digest(const std::string &input) {
   std::vector<uint8_t> message(input.begin(), input.end());
@@ -335,14 +318,15 @@ void WebSocketsServer::begin() {
   if (impl_->active)
     return;
 
-  impl_->fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  sim_socket::init();
+  impl_->fd = static_cast<int>(::socket(AF_INET, SOCK_STREAM, 0));
   if (impl_->fd < 0) {
-    LOG_ERR("WS", "[SIM] WebSocket socket failed: %s", strerror(errno));
+    LOG_ERR("WS", "[SIM] WebSocket socket failed: %s",
+            sim_socket::lastError().c_str());
     return;
   }
 
-  int yes = 1;
-  setsockopt(impl_->fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+  sim_socket::setListenerAddressOptions(impl_->fd);
 
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
@@ -351,14 +335,15 @@ void WebSocketsServer::begin() {
   if (::bind(impl_->fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) !=
       0) {
     LOG_ERR("WS", "[SIM] WebSocket bind 127.0.0.1:%d failed: %s", impl_->port,
-            strerror(errno));
-    ::close(impl_->fd);
+            sim_socket::lastError().c_str());
+    sim_socket::close(impl_->fd);
     impl_->fd = -1;
     return;
   }
   if (::listen(impl_->fd, 8) != 0) {
-    LOG_ERR("WS", "[SIM] WebSocket listen failed: %s", strerror(errno));
-    ::close(impl_->fd);
+    LOG_ERR("WS", "[SIM] WebSocket listen failed: %s",
+            sim_socket::lastError().c_str());
+    sim_socket::close(impl_->fd);
     impl_->fd = -1;
     return;
   }
@@ -366,10 +351,12 @@ void WebSocketsServer::begin() {
   impl_->active = true;
   impl_->acceptThread = std::thread([this] {
     while (impl_->active) {
-      const int client = ::accept(impl_->fd, nullptr, nullptr);
+      const int client =
+          static_cast<int>(::accept(impl_->fd, nullptr, nullptr));
       if (client < 0) {
         if (impl_->active)
-          LOG_ERR("WS", "[SIM] WebSocket accept failed: %s", strerror(errno));
+          LOG_ERR("WS", "[SIM] WebSocket accept failed: %s",
+                  sim_socket::lastError().c_str());
         continue;
       }
       setSocketTimeouts(client);
@@ -379,14 +366,14 @@ void WebSocketsServer::begin() {
         std::string raw;
         char buffer[2048];
         while (raw.find("\r\n\r\n") == std::string::npos) {
-          const ssize_t got = ::recv(client, buffer, sizeof(buffer), 0);
+          const ssize_t got = sim_socket::recv(client, buffer, sizeof(buffer));
           if (got <= 0) {
-            ::close(client);
+            sim_socket::close(client);
             return;
           }
           raw.append(buffer, static_cast<size_t>(got));
           if (raw.size() > 32768) {
-            ::close(client);
+            sim_socket::close(client);
             return;
           }
         }
@@ -408,7 +395,7 @@ void WebSocketsServer::begin() {
 
         const auto keyIt = headers.find("sec-websocket-key");
         if (keyIt == headers.end()) {
-          ::close(client);
+          sim_socket::close(client);
           return;
         }
 
@@ -419,7 +406,7 @@ void WebSocketsServer::begin() {
                  << "Sec-WebSocket-Accept: "
                  << websocketAcceptValue(keyIt->second) << "\r\n\r\n";
         if (!sendAll(client, response.str().data(), response.str().size())) {
-          ::close(client);
+          sim_socket::close(client);
           return;
         }
 
@@ -446,7 +433,7 @@ void WebSocketsServer::begin() {
 
         impl_->pushEvent({num, WStype_DISCONNECTED, {}, 0});
         impl_->removeClient(num);
-        ::close(client);
+        sim_socket::close(client);
       });
     }
   });
@@ -488,13 +475,13 @@ void WebSocketsServer::sendTXT(uint8_t num, const char *txt) {
 void WebSocketsServer::close() {
   impl_->active = false;
   if (impl_->fd >= 0) {
-    ::shutdown(impl_->fd, SHUT_RDWR);
-    ::close(impl_->fd);
+    sim_socket::shutdownBoth(impl_->fd);
+    sim_socket::close(impl_->fd);
     impl_->fd = -1;
   }
 
   for (const int fd : impl_->clientFds())
-    ::shutdown(fd, SHUT_RDWR);
+    sim_socket::shutdownBoth(fd);
   {
     std::lock_guard<std::mutex> lock(impl_->clientsMutex);
     impl_->clients.clear();

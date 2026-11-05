@@ -1,6 +1,14 @@
 
-#include <SDL.h>
+#ifdef _WIN32
+// This file defines main() itself; do not let SDL rename it to SDL_main.
+#define SDL_MAIN_HANDLED
+#include <process.h> // _exit
+#else
 #include <unistd.h>
+#endif
+
+#include <SDL.h>
+#include <cstdio>
 
 #include "Arduino.h"
 #include "HalDisplay.h"
@@ -14,6 +22,12 @@ extern void loop();
 extern HalDisplay display; // defined in main.cpp
 
 int main(int argc, char **argv) {
+#ifdef _WIN32
+  SimulatorLifecycle::superviseIfNeeded();
+  SDL_SetMainReady();
+  // Stdout is fully buffered when piped and _exit() below does not flush.
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
+#endif
   SimulatorLifecycle::initProcessArgs(argv);
   simStackCheckStartup();
   setup();
