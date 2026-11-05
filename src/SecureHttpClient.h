@@ -10,10 +10,47 @@
 
 #include "HTTPClient.h"
 #include "NetworkClient.h"
+#include "WiFi.h"
 #include "SimHttpFetch.h"
 #include "WString.h"
 
 namespace freeink {
+
+// The failure half of the SDK's SecureClient. curl's exit code is translated to the
+// wolfSSL code the device would report, so a failure reads the same on the Borges
+// screen. Only curl decides whether a certificate is good here.
+class SecureClient {
+public:
+  enum class FailStage : uint8_t { None, Tcp, Alloc, TrustLoad, Handshake, Timeout, Aborted };
+  FailStage lastFailStage() const { return stage_; }
+  int lastFailCode() const { return code_; }
+  void *nativeHandle() const { return nullptr; }
+  void record(int curlExit, bool aborted) {
+    stage_ = FailStage::None;
+    code_ = 0;
+    if (aborted) {
+      stage_ = FailStage::Aborted;
+    } else if (curlExit == 6 || curlExit == 7 || curlExit == 28) {
+      stage_ = FailStage::Tcp;  // Could not resolve, could not connect, timed out.
+    } else if (curlExit == 51) {
+      stage_ = FailStage::Handshake;
+      code_ = -322;  // DOMAIN_NAME_MISMATCH
+    } else if (curlExit == 60 || curlExit == 77) {
+      stage_ = FailStage::Handshake;
+      code_ = -188;  // ASN_NO_SIGNER_E
+    } else if (curlExit == 35) {
+      stage_ = FailStage::Handshake;
+      code_ = -313;  // FATAL_ERROR
+    } else if (curlExit != 0) {
+      stage_ = FailStage::Handshake;
+      code_ = -curlExit;
+    }
+  }
+
+private:
+  FailStage stage_ = FailStage::None;
+  int code_ = 0;
+};
 
 // Mirrors the public surface of the SDK's SecureHttpClient, so firmware code
 // written against it also runs here. TLS is curl's, not wolfSSL: this does not
@@ -26,6 +63,12 @@ public:
 
   void setCACert(const char *) {}
   void setInsecure() { insecure_ = true; }
+  // curl verifies against the host's store; the device's anchors play no part here.
+  void setTrustAnchors(const char *const *, size_t) { insecure_ = false; }
+  // curl dials by name: the address the device would pin is not needed.
+  void setServerAddress(IPAddress) {}
+  void clearServerAddress() {}
+  void setConnectTimeout(uint32_t) {}
   void setTimeout(uint32_t ms) { timeoutMs_ = ms; }
   void setProgressCallback(const ProgressCallback &progress) {
     progress_ = progress;
@@ -120,6 +163,12 @@ public:
 
   static bool tls13Available() { return true; }
 
+  enum class Stage : uint8_t { None, Connect, Send, Headers, Body };
+  Stage lastStage() const { return response_.statusCode > 0 ? Stage::Body : Stage::Connect; }
+  const SecureClient &secureClient() const { return secure_; }
+  // Every request is its own curl run, so there is never a connection to reuse.
+  bool hasLiveConnection() const { return false; }
+
 private:
   void resetResponse() {
     response_ = sim_http_fetch::Response{};
@@ -168,6 +217,7 @@ private:
     sim_http_fetch::Response result;
     const bool ok = sim_http_fetch::fetch(request, result);
     response_ = std::move(result);
+    secure_.record(response_.curlExitCode, response_.stoppedByAbort);
     complete_ = ok && response_.curlExitCode == 0 &&
                 !response_.stoppedByAbort && !response_.stoppedByData;
     if (!ok || response_.statusCode <= 0)
@@ -183,6 +233,7 @@ private:
   int followRedirects_ = 0;
   uint32_t timeoutMs_ = 0;
   ProgressCallback progress_;
+  SecureClient secure_;
   sim_http_fetch::Response response_;
   bool complete_ = false;
 };
